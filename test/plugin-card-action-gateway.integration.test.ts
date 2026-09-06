@@ -100,6 +100,23 @@ const requestsFrom = (logPath: string): Array<Record<string, any>> => {
   return readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
 };
 
+/** The fixture appends its log line when the request body has been fully
+ *  received, in its own process; a dispatch that gave up on the response can
+ *  resolve a few milliseconds before that line lands. Wait for it instead of
+ *  reading the file at the exact moment the client returned. */
+const waitForRequests = async (
+  logPath: string,
+  count: number,
+  timeoutMs = 2_000,
+): Promise<Array<Record<string, any>>> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const requests = requestsFrom(logPath);
+    if (requests.length >= count || Date.now() >= deadline) return requests;
+    await new Promise(resolveTick => setTimeout(resolveTick, 20));
+  }
+};
+
 afterEach(async () => {
   await Promise.all([...children].map(stopFixture));
   for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
@@ -164,7 +181,11 @@ describe('plugin card action gateway loopback integration', () => {
       { mode: 'invalid-json', responseMaxBytes: 1024, timeoutMs: 500 },
       { mode: 'invalid-schema', responseMaxBytes: 1024, timeoutMs: 500 },
       { mode: 'oversized', responseMaxBytes: 256, timeoutMs: 500 },
-      { mode: 'success', responseMaxBytes: 1024, timeoutMs: 25, delayMs: 200 },
+      // Timeout: the budget must comfortably cover a loopback round trip on a
+      // loaded CI runner (25ms did not — the client aborted before the fixture
+      // had even received the body), while the fixture's reply stays far
+      // beyond it so the gateway still gives up.
+      { mode: 'success', responseMaxBytes: 1024, timeoutMs: 200, delayMs: 2_000 },
     ]) {
       const fixture = await startFixture(testCase.mode, { delayMs: testCase.delayMs });
       const record = recordFor();
@@ -180,7 +201,7 @@ describe('plugin card action gateway loopback integration', () => {
       await expect(gateway.dispatch({
         action: { value: { action: 'example.review.submit' } },
       }, 'cli_current')).resolves.toBeUndefined();
-      expect(requestsFrom(fixture.logPath)).toHaveLength(1);
+      expect(await waitForRequests(fixture.logPath, 1)).toHaveLength(1);
       await stopFixture(fixture.child);
     }
   });
